@@ -1,0 +1,484 @@
+import groovy.json.JsonSlurper
+import nz.govt.natlib.m11n.tools.automation.git.GitCommander
+import nz.govt.natlib.m11n.tools.automation.logging.Timekeeper
+import nz.govt.natlib.m11n.tools.automation.maven.repository.RepositoryWorkflow
+import nz.govt.natlib.m11n.tools.automation.shell.ShellCommand
+import nz.govt.natlib.m11n.tools.automation.shell.ShellException
+import nz.govt.natlib.m11n.tools.gradle.BuildException
+import nz.govt.natlib.m11n.tools.gradle.ProjectHelper
+
+buildscript {
+    repositories {
+        mavenLocal()
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'nz.govt.natlib.m11n.tools:automation-plugin:1.0.0-SNAPSHOT'
+        classpath 'nz.govt.natlib.m11n.tools:gradle-plugin:1.0.0-SNAPSHOT'
+    }
+}
+
+group 'nz.govt.natlib.m11n.tools'
+description = 'National Library WebCurator Modernisation Tools repository splitter updater'
+
+project.ext {
+    vendor = "National Library of New Zealand"
+    versionNumber = "1.0.0-SNAPSHOT"
+
+    showCommandOutputValue = (project.hasProperty('showCommandOutput') ? project.showCommandOutput.toBoolean() : false).toBoolean()
+    tempWorkFolderName = project.hasProperty('tempWorkFolder') ? project.tempWorkFolder : null
+    reportsFolderName = project.hasProperty('reportsFolder') ? project.reportsFolder : null
+    doAutocreateReportsFolder = (project.hasProperty('autocreateReportsFolder') ? project.autocreateReportsFolder.toBoolean() : false).toBoolean()
+
+    // Source repository parameters
+    sourceRepositoryWorkingFolderName = project.hasProperty('sourceRepositoryWorkingFolder') ? project.sourceRepositoryWorkingFolder : null
+    doAutocreateSourceRepositoryWorkingFolder = (project.hasProperty('autocreateSourceRepositoryWorkingFolder') ? project.autocreateSourceRepositoryWorkingFolder.toBoolean() : false).toBoolean()
+    sourceRepositoryNameBaseValue = project.hasProperty('sourceRepositoryNameBase') ? project.sourceRepositoryNameBase : null
+    repositoryWorkflowStartingSequenceIndexValue = project.hasProperty('repositoryWorkflowStartingSequenceIndex') ?
+            Integer.valueOf(Integer.parseInt(project.repositoryWorkflowStartingSequenceIndex)) : Integer.valueOf(0)
+    // Cloning the source repository
+    doCloneSourceRepository = ProjectHelper.hasAnyTasks(project, [ "cloneSourceRepository" ])
+    sourceCodeRepositoryServerUrlName = project.hasProperty('sourceCodeRepositoryServerUrl') ? project.sourceCodeRepositoryServerUrl : null
+    // Git branches
+    sourceRepositoryGitBranchName = project.hasProperty('sourceRepositoryGitBranch') ? project.sourceRepositoryGitBranch : null
+    // These branch names are preserved and are in addition to the sourceRepositoryGitBranch. Branch names are comma-separated.
+    preserveBranchNamesAsOneString = project.hasProperty('preserveBranchNames') ? project.preserveBranchNames : null
+
+    // Split-target repository parameters JSON file
+    projectParametersJsonFileName = project.hasProperty('projectParametersJsonFile') ? project.projectParametersJsonFile : null
+
+    // Split-target repository parameters
+    splitTargetProjectsRootFolderName = project.hasProperty('splitTargetProjectsRootFolder') ? project.splitTargetProjectsRootFolder : null
+    doAutocreateSplitTargetProjectsRootFolder = (project.hasProperty('autocreateSplitTargetProjectsRootFolder') ? project.autocreateSplitTargetProjectsRootFolder.toBoolean() : false).toBoolean()
+    splitTargetRepositoryServerUrlBaseName = project.hasProperty('splitTargetRepositoryServerUrlBase') ? project.splitTargetRepositoryServerUrlBase : null
+    doCloneSplitTargetRepositoriesRemoveRemoteOrigin = (project.hasProperty('cloneSplitTargetRepositoriesRemoveRemoteOrigin') ? project.cloneSplitTargetRepositoriesRemoveRemoteOrigin.toBoolean() : true).toBoolean()
+
+    patchTargetRepositoryFolderName = project.hasProperty('patchTargetRepositoryFolder') ? project.patchTargetRepositoryFolder : null
+    patchTargetRepositoryBranchName = project.hasProperty('patchTargetRepositoryBranch') ? project.patchTargetRepositoryBranch : null
+    patchTargetRepositoryBaseBranchName = project.hasProperty('patchTargetRepositoryBaseBranch') ? project.patchTargetRepositoryBaseBranch : null
+    doCreatePatchTargetRepositoryBranch = (project.hasProperty('createPatchTargetRepositoryBranch') ? project.createPatchTargetRepositoryBranch.toBoolean() : false).toBoolean()
+    patchesFolderPathValue = project.hasProperty('patchesFolderPath') ? project.patchesFolderPath : null
+
+
+    includeProjectNamesAsOneString = project.hasProperty('includeProjectNames') ? project.includeProjectNames : ''
+    excludeProjectNamesAsOneString = project.hasProperty('excludeProjectNames') ? project.excludeProjectNames : ''
+}
+
+apply plugin: 'base'
+
+setVersion(project.versionNumber)
+
+configurations {
+}
+
+Timekeeper timekeeper = new Timekeeper()
+timekeeper.start()
+
+Map<String, Map<String, Object>> projectNameToParametersMap = [ : ]
+List<String> includeProjectNamesList = [ ]
+List<String> excludeProjectNamesList = [ ]
+List<String> filteredProjectNamesList = [ ]
+
+Closure<Map> loadProjectsParameters = {
+    JsonSlurper jsonSlurper = new JsonSlurper()
+    File projectParametersJsonFile = new File(project.projectParametersJsonFileName)
+    if (!projectParametersJsonFile.exists()) {
+        throw new BuildException("projectParametersJsonFile=${project.projectParametersJsonFileName} does not exist. It must exist.")
+    }
+    Map jsonMap = (Map) jsonSlurper.parse(projectParametersJsonFile)
+    Map projects = jsonMap.get("projects")
+    projects.entrySet().each() { Map.Entry entry ->
+        String projectName = entry.key
+        // Ignore comments (start with '#' or '//' and blank names
+        if (!(projectName ==~ /\s*(#|\/\/).*?/) && !projectName.trim().isEmpty()) {
+            projectNameToParametersMap.put(projectName, entry.value)
+            project.logger.info("project=${projectName}, value=${entry.value}")
+        }
+    }
+    if (project.includeProjectNamesAsOneString != null && project.includeProjectNamesAsOneString.length() > 0) {
+        includeProjectNamesList = project.includeProjectNamesAsOneString.toString().split(',') as List<String>
+    }
+    if (project.excludeProjectNamesAsOneString != null && project.excludeProjectNamesAsOneString.length() > 0) {
+        excludeProjectNamesList = project.excludeProjectNamesAsOneString.toString().split(',') as List<String>
+    }
+    projectNameToParametersMap.keySet().each { String projectNameKey ->
+        // the includeProjectNamesList takes precedence over the excludeProjectNamesList
+        if (!includeProjectNamesList.isEmpty()) {
+            if (includeProjectNamesList.contains(projectNameKey) && !excludeProjectNamesList.contains(projectNameKey)) {
+                filteredProjectNamesList.add(projectNameKey)
+            }
+        } else {
+            if (!excludeProjectNamesList.contains(projectNameKey)) {
+                filteredProjectNamesList.add(projectNameKey)
+            }
+        }
+    }
+    return projectNameToParametersMap
+}
+
+Closure<ShellCommand> executeCommand = { String commandString, File folder ->
+    if (!folder.exists()) {
+        throw new BuildException("Project projectLocationFolder=[${folder}] must exist.")
+    }
+    ShellCommand shellCommand = new ShellCommand(showOutput: (Boolean) project.showCommandOutputValue, exceptionOnError: true,
+            exceptionMessagePrefix: "Unable to '${commandString}'")
+    project.logger.info("Starting command=[${commandString}] on ${folder}")
+    ShellException shellException = null
+    try {
+        shellCommand.executeOnShellWithWorkingDirectory(commandString, folder)
+        project.logger.info("Completed command=[${commandString}] on ${folder}")
+    } catch (ShellException e) {
+        shellException = e
+    }
+    if (shellException != null) {
+        project.logger.info(shellCommand.getOutput())
+        throw shellException
+    }
+
+    return shellCommand
+}
+
+Closure<String[]> allPreserveBranchNames = {
+    List<String> allBranchNames = [ ]
+    if (project.preserveBranchNamesAsOneString != null) {
+        project.preserveBranchNamesAsOneString.toString().split(',').each { String branchName ->
+            if (!branchName.isEmpty()) {
+                allBranchNames.add(branchName)
+            }
+        }
+    }
+    if (project.sourceRepositoryGitBranchName != null && !project.sourceRepositoryGitBranchName.isEmpty()) {
+        // make sure it's last
+        if (allBranchNames.contains(project.sourceRepositoryGitBranchName)) {
+            allBranchNames.remove(project.sourceRepositoryGitBranchName)
+        }
+        allBranchNames.add(project.sourceRepositoryGitBranchName)
+    }
+    allBranchNames as String[]
+}
+
+Closure<RepositoryWorkflow> createRepositoryWorkflow = { boolean allProcessingValues ->
+    RepositoryWorkflow repositoryWorkflow = new RepositoryWorkflow()
+
+    repositoryWorkflow.doStartWithCopy = allProcessingValues
+    repositoryWorkflow.doSubdirectoryFilter = allProcessingValues
+    repositoryWorkflow.doPullIntoNewRepository = allProcessingValues
+    repositoryWorkflow.doCopyToWorkingRepository = allProcessingValues
+    repositoryWorkflow.doRemoveFolders = allProcessingValues
+    repositoryWorkflow.doPostRemovalFoldersPull = allProcessingValues
+    repositoryWorkflow.doPostRemoveFoldersBigToSmallReport = allProcessingValues
+    repositoryWorkflow.doDeleteIntermediateRepositories = allProcessingValues
+    repositoryWorkflow.doCreatePatches = allProcessingValues
+    repositoryWorkflow.doBigToSmallReport = allProcessingValues
+    repositoryWorkflow.doApplyPatches = allProcessingValues
+    repositoryWorkflow.doFinalRepositorySize = allProcessingValues
+    repositoryWorkflow.reportsFolderPath = project.reportsFolderName
+
+    if (repositoryWorkflow.doBigToSmallReport) {
+        if (project.reportsFolderName == null) {
+            throw new BuildException("'reportsFolder' cannot be null when doing a bigToSmallReport. Use -PreportsFolder=<reports-folder-name>.")
+        } else {
+            File reportsFolderFile = new File((String) project.reportsFolderName)
+            if (reportsFolderFile.exists()) {
+                if (!reportsFolderFile.isDirectory()) {
+                    throw new BuildException("reportsFolder=${reportsFolderFile.getCanonicalPath()} must be a directory.")
+                }
+            } else {
+                if (project.doAutocreateReportsFolder) {
+                    reportsFolderFile.mkdirs()
+                } else {
+                    throw new BuildException("reportsFolder=${reportsFolderFile.getCanonicalPath()} does not exist. Please use -PautocreateReportsFolder=true to automatically create this folder.")
+                }
+            }
+        }
+    }
+    return repositoryWorkflow
+}
+
+Closure<File> performRepositoryWorkflow = { String projectNameKey, RepositoryWorkflow repositoryWorkflow ->
+    Map<String, Object> projectParametersMap = projectNameToParametersMap.get(projectNameKey)
+
+    repositoryWorkflow.projectNameKey = projectNameKey
+
+    repositoryWorkflow.repositoryBaseName = "${project.sourceRepositoryNameBaseValue}"
+    repositoryWorkflow.sequenceIndex = project.repositoryWorkflowStartingSequenceIndexValue
+
+    repositoryWorkflow.workflowName = "work-${projectNameKey}"
+    repositoryWorkflow.subdirectoryFilterPath = projectParametersMap.get("subdirectoryFilterPath")
+
+    if (project.preserveBranchNamesAsOneString == null && project.sourceRepositoryGitBranchName == null) {
+        throw new BuildException("'preserveBranchNames' or 'sourceRepositoryGitBranch' must be specified. " +
+                "On the command line this would done by specifying -PpreserveBranchNames=[comma-separated-list-of-branch-names-to-preserve] or -PsourceRepositoryGitBranch=[source-repository-git-branch-name]")
+    }
+    String[] preserveBranchNames = allPreserveBranchNames()
+    repositoryWorkflow.preserveBranchNames = preserveBranchNames
+    repositoryWorkflow.workParentFolderPath = project.sourceRepositoryWorkingFolderName
+
+    if (project.tempWorkFolderName == null) {
+        throw new BuildException("'tempWorkFolder' must be specified. " +
+                "On the command line this would done by specifying -PtempWorkFolder=[temp-work-folder] ")
+    }
+    repositoryWorkflow.tempFolder = project.tempWorkFolderName
+
+    repositoryWorkflow.patchTargetRepositoryPath = project.patchTargetRepositoryFolderName + File.separator + projectNameKey
+    repositoryWorkflow.patchTargetRepositoryBranch = project.patchTargetRepositoryBranchName
+    repositoryWorkflow.patchesFolderPath = project.patchesFolderPathValue
+
+    List<String> nonexistentFilesAndFolders = projectParametersMap.get("nonexistentFilesAndFolders")
+    List<String> removalFolders = projectParametersMap.get("removalFilesAndFolders")
+    StringBuilder allFilesAndFoldersAsSingleString = new StringBuilder()
+    nonexistentFilesAndFolders.each { String fileOrFolderName ->
+        allFilesAndFoldersAsSingleString.append(fileOrFolderName)
+        allFilesAndFoldersAsSingleString.append(" ")
+    }
+    removalFolders.each { String fileOrFolderName ->
+        allFilesAndFoldersAsSingleString.append(fileOrFolderName)
+        allFilesAndFoldersAsSingleString.append(" ")
+    }
+    repositoryWorkflow.removalFolders = allFilesAndFoldersAsSingleString.toString()
+
+    project.logger.info("")
+
+    repositoryWorkflow.setup()
+
+    repositoryWorkflow.doWorkflow()
+
+    // Delete the intermediate repository from project.repositoryWorkflowStartingSequenceIndexValue + 1, since we keep 0 for the next one
+    repositoryWorkflow.deleteIntermediateRepositories(((Integer) project.repositoryWorkflowStartingSequenceIndexValue) + 1, false)
+
+    File finalRepository = new File(repositoryWorkflow.workParentFolderPath + File.separator + repositoryWorkflow.currentRepositoryName)
+    File finalRepositoryRename = finalRepository
+    // Rename the final repository to ${projectNameKey}-${preserveBranchNames.last()} and use that name for the next stream of work.
+    if (repositoryWorkflow.sequenceIndex > project.repositoryWorkflowStartingSequenceIndexValue) {
+        finalRepositoryRename = new File(repositoryWorkflow.workParentFolderPath + File.separator + projectNameKey.toLowerCase() + '-' + preserveBranchNames.last().toLowerCase())
+        project.logger.info("Renaming finalRepository=${finalRepository} to finalRepositoryRename=${finalRepositoryRename}")
+        finalRepository.renameTo(finalRepositoryRename)
+        // Take the last in the sequence
+        repositoryWorkflow.currentRepositoryName = finalRepositoryRename.name
+    } else {
+        project.logger.info("Not renaming ${repositoryWorkflow.currentRepositoryName} as the repositoryWorkflow.sequenceIndex=${repositoryWorkflow.sequenceIndex} is NOT > project.repositoryWorkflowStartingSequenceIndexValue=${project.repositoryWorkflowStartingSequenceIndexValue}")
+    }
+
+    timekeeper.logElapsed()
+
+    return finalRepositoryRename
+}
+
+task assembleProjectsParameters {
+    doLast {
+        if (project.projectParametersJsonFileName != null) {
+            loadProjectsParameters()
+        } else {
+            throw new BuildException("'projectParametersJsonFile' must be specified. " +
+                    "On the command line this would done by specifying -PprojectParametersJsonFile=[project-parameters-json-file]")
+        }
+        if (project.logger.isEnabled(LogLevel.INFO)) {
+            project.logger.info("List of projects to process:")
+            filteredProjectNamesList.each { String projectName ->
+                project.logger.info("projectName=${projectName}")
+            }
+        }
+        timekeeper.logElapsed()
+    }
+}
+
+task cloneSourceRepository {
+    if (project.doCloneSourceRepository) {
+        if (project.sourceRepositoryWorkingFolderName == null) {
+            throw new BuildException("cloneSourceRepository requires sourceRepositoryWorkingFolder being set. Use -PsourceRepositoryWorkingFolder=[source-repository-root-folder].")
+        }
+        if (sourceCodeRepositoryServerUrlName == null) {
+            throw new BuildException("'sourceCodeRepositoryServerUrl' must not be null. Use -PsourceCodeRepositoryServerUrl=[source-code-repository-server-url].")
+        }
+    }
+    doLast {
+        File rootFolder
+        if (project.doCloneSourceRepository) {
+            rootFolder = new File(project.sourceRepositoryWorkingFolderName)
+            if (!rootFolder.exists()) {
+                if (project.doAutocreateSourceRepositoryWorkingFolder) {
+                    rootFolder.mkdirs()
+                } else {
+                    throw new BuildException("${rootFolder} does not exist. cloneSourceRepository requires that -PautocreateSourceRepositoryWorkingFolder=true in order to create the projects root folder.")
+                }
+            }
+            String repositoryName = "${project.sourceRepositoryNameBaseValue}-${project.repositoryWorkflowStartingSequenceIndexValue}"
+            String command = "git clone -b ${project.sourceRepositoryGitBranchName} ${project.sourceCodeRepositoryServerUrlName} ${repositoryName}"
+            executeCommand(command, rootFolder)
+            File sourceRepositoryFolder = new File(rootFolder, "${repositoryName}")
+            if (project.preserveBranchNamesAsOneString != null) {
+                String[] preserveBranchNames = project.preserveBranchNamesAsOneString.toString().split(",")
+                preserveBranchNames.each { String branchName ->
+                    command = "git checkout ${branchName}"
+                    executeCommand(command, sourceRepositoryFolder)
+                }
+            }
+            if (project.sourceRepositoryGitBranchName != null) {
+                command = "git checkout ${project.sourceRepositoryGitBranchName}"
+                executeCommand(command, sourceRepositoryFolder)
+            } else {
+                throw new BuildException("'sourceRepositoryGitBranch' must be specified. Use -PsourceRepositoryGitBranch=[source-repository-git-branch-name].")
+            }
+            command = "git remote rm origin"
+            executeCommand(command, sourceRepositoryFolder)
+            timekeeper.logElapsed()
+        }
+    }
+}
+
+task createSplitTargetRepositories(dependsOn: [ assembleProjectsParameters, cloneSourceRepository ]) {
+    if (ProjectHelper.hasAnyTasks(project, [ "createSplitTargetRepositories" ])) {
+        if (project.ext.splitTargetProjectsRootFolderName == null) {
+            throw new BuildException("createSplitTargetRepositories requires splitTargetProjectsRootFolder being set. Use -PsplitTargetProjectsRootFolder=[project-root-folder].")
+        }
+    }
+    doLast {
+        if (ProjectHelper.hasAnyTasks(project, [ "createSplitTargetRepositories" ])) {
+            filteredProjectNamesList.each { String projectNameKey ->
+                RepositoryWorkflow repositoryWorkflow = createRepositoryWorkflow(true)
+                repositoryWorkflow.doCreatePatches = false
+                repositoryWorkflow.doApplyPatches = false
+                performRepositoryWorkflow(projectNameKey, repositoryWorkflow)
+                timekeeper.logElapsed()
+            }
+        }
+    }
+}
+
+task cloneSplitTargetRepositories(dependsOn: [ assembleProjectsParameters, cloneSourceRepository ]) {
+    if (ProjectHelper.hasAnyTasks(project, [ "cloneSplitTargetRepositories" ])) {
+        if (project.ext.splitTargetProjectsRootFolderName == null) {
+            throw new BuildException("cloneSplitTargetRepositories requires splitTargetProjectsRootFolder being set. Use -PsplitTargetProjectsRootFolder=[project-root-folder].")
+        }
+        if (splitTargetRepositoryServerUrlBaseName == null) {
+            throw new BuildException("'splitTargetRepositoryServerUrlBase' must not be null. Use -PsplitTargetRepositoryServerUrlBase=[split-target-repository-server-url-base].")
+        }
+    }
+    doLast {
+        File rootFolder
+        if (ProjectHelper.hasAnyTasks(project, [ "cloneSplitTargetRepositories" ])) {
+            if (filteredProjectNamesList.isEmpty()) {
+                throw new BuildException("${project.projectParametersJsonFileName} in combination with includeProjectNames=${includeProjectNamesList} and excludeProjectNames=${includeProjectNamesList} must contain at least one project.")
+            }
+            rootFolder = new File((String) project.splitTargetProjectsRootFolderName)
+            if (!rootFolder.exists()) {
+                if (project.doAutocreateSplitTargetProjectsRootFolder) {
+                    rootFolder.mkdirs()
+                } else {
+                    throw new BuildException("${rootFolder} does not exist. cloneSplitTargetRepositories requires that -PautocreateSplitTargetProjectsRootFolder=true in order to create the projects root folder.")
+                }
+            }
+            GitCommander gitCommander = new GitCommander()
+            gitCommander.showOutput = (Boolean) project.showCommandOutputValue
+            gitCommander.setup()
+            filteredProjectNamesList.each { String projectNameKey ->
+                String command = "git clone -b ${allPreserveBranchNames().first()} ${project.splitTargetRepositoryServerUrlBaseName}/${projectNameKey}.git"
+                executeCommand(command, rootFolder)
+                String clonePath = "${rootFolder.absolutePath}${File.separator}${projectNameKey}"
+                allPreserveBranchNames().each { String branchName ->
+                    gitCommander.checkoutBranch(clonePath, branchName, true)
+                }
+                if (project.doCreatePatchTargetRepositoryBranch) {
+                    gitCommander.createBranch(clonePath, project.patchTargetRepositoryBranchName, project.patchTargetRepositoryBaseBranchName)
+                }
+                if (project.doCloneSplitTargetRepositoriesRemoveRemoteOrigin) {
+                    gitCommander.removeRemoteOrigin(clonePath)
+                }
+            }
+        }
+        timekeeper.logElapsed()
+    }
+}
+
+task extractAndPatchProjects(dependsOn: [ cloneSourceRepository, cloneSplitTargetRepositories ]) {
+    doLast {
+        if (ProjectHelper.hasAnyTasks(project, [ "extractAndPatchProjects" ])) {
+            filteredProjectNamesList.each { String projectNameKey ->
+                RepositoryWorkflow repositoryWorkflow = createRepositoryWorkflow(true)
+                performRepositoryWorkflow(projectNameKey, repositoryWorkflow)
+                timekeeper.logElapsed()
+            }
+        }
+    }
+}
+
+task createAndApplyPatchesOnly(dependsOn: [ cloneSourceRepository, cloneSplitTargetRepositories ]) {
+    doLast {
+        if (ProjectHelper.hasAnyTasks(project, [ "createAndApplyPatchesOnly" ])) {
+            filteredProjectNamesList.each { String projectNameKey ->
+                RepositoryWorkflow repositoryWorkflow = createRepositoryWorkflow(false)
+                repositoryWorkflow.doCreatePatches = true
+                repositoryWorkflow.doApplyPatches = true
+                performRepositoryWorkflow(projectNameKey, repositoryWorkflow)
+                timekeeper.logElapsed()
+            }
+        }
+        timekeeper.logElapsed()
+    }
+}
+
+task applyPatchesOnly(dependsOn: [ cloneSourceRepository, cloneSplitTargetRepositories ]) {
+    doLast {
+        if (ProjectHelper.hasAnyTasks(project, [ "applyPatchesOnly" ])) {
+            filteredProjectNamesList.each { String projectNameKey ->
+                RepositoryWorkflow repositoryWorkflow = createRepositoryWorkflow(false)
+                repositoryWorkflow.doApplyPatches = true
+                performRepositoryWorkflow(projectNameKey, repositoryWorkflow)
+                timekeeper.logElapsed()
+            }
+        }
+        timekeeper.logElapsed()
+    }
+}
+
+task restoreRemoteOriginForProjects(dependsOn: [ cloneSplitTargetRepositories, extractAndPatchProjects ]) {
+    doLast {
+        if (ProjectHelper.hasAnyTasks(project, [ "restoreRemoteOriginForProjects" ])) {
+            File rootFolder = new File((String) project.splitTargetProjectsRootFolderName)
+            filteredProjectNamesList.each { String projectNameKey ->
+                GitCommander gitCommander = new GitCommander()
+                gitCommander.showOutput = true
+                gitCommander.setup()
+                String repositoryPath = "${rootFolder.absolutePath}${File.separator}${projectNameKey}"
+                String remoteOrigin = "${project.splitTargetRepositoryServerUrlBaseName}/${projectNameKey}.git"
+                boolean doPull = true
+                gitCommander.setRemoteOrigin(repositoryPath, project.patchTargetRepositoryBranchName, remoteOrigin, doPull)
+                timekeeper.logElapsed()
+            }
+        }
+    }
+}
+
+task pushBranchOriginForProjects(dependsOn: [ cloneSplitTargetRepositories, extractAndPatchProjects, restoreRemoteOriginForProjects ]) {
+    doLast {
+        if (ProjectHelper.hasAnyTasks(project, [ "pushBranchOriginForProjects" ])) {
+            File rootFolder = new File((String) project.splitTargetProjectsRootFolderName)
+            filteredProjectNamesList.each { String projectNameKey ->
+                GitCommander gitCommander = new GitCommander()
+                gitCommander.showOutput = true
+                gitCommander.setup()
+                String repositoryPath = "${rootFolder.absolutePath}${File.separator}${projectNameKey}"
+                gitCommander.pushBranchOrigin(repositoryPath, project.patchTargetRepositoryBranchName)
+                timekeeper.logElapsed()
+            }
+        }
+    }
+}
+
+task createMergeBranchForProjects(dependsOn: [ cloneSplitTargetRepositories, restoreRemoteOriginForProjects, pushBranchOriginForProjects ]) {
+    doLast {
+        if (ProjectHelper.hasAnyTasks(project, [ "createMergeBranchForProjects" ])) {
+            File rootFolder = new File((String) project.splitTargetProjectsRootFolderName)
+            filteredProjectNamesList.each { String projectNameKey ->
+                GitCommander gitCommander = new GitCommander()
+                gitCommander.showOutput = true
+                gitCommander.setup()
+                String repositoryPath = "${rootFolder.absolutePath}${File.separator}${projectNameKey}"
+                gitCommander.setBranch(repositoryPath, project.patchTargetRepositoryBranchName)
+
+                timekeeper.logElapsed()
+            }
+        }
+    }
+}
+
