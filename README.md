@@ -1,9 +1,12 @@
 # nlnz-m11n-tools-repository-splitter-updater National Library of New Zealand Modernisation Tools repository splitter and updater
 
+Tools for for splitting a source repository into path-based repositories, creating patches for updating those split
+repositories when the source repository changes and applying those patches.
+
 ## Synopsis
 
-This repository contains a gradle build that splits the a source repository into path-based repositories and
-create patches for updating those split repositories when the source repository changes.
+This repository contains gradle build tasks for splitting a source repository into path-based repositories,
+creating patches for updating those split repositories when the source repository changes and applying those patches.
 
 ## Motivation
 
