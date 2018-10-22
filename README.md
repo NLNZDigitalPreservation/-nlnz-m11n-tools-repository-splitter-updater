@@ -586,6 +586,51 @@ Pushes the branch to origin.
 
 Creates a merge branch for the filtered project list.
 
+## Pushing a split-target repository to github
+
+After creating a split-target repository with the task `createSplitTargetRepositories`, you may want to create this
+repository in github and push your changes to github. There are several steps in this process.
+
+For the description of this process, we will use the example split-target repository of `example-split-target-repository`
+which has a `patchTargetRepositoryBaseBranch` of `split-target-base-branch`.
+
+We assume that as part of the split-target repository creation that a `master` branch has been created along with the
+`patchTargetRepositoryBaseBranch` (or some other branch that reflects the default branch for the repository). It's useful
+to confirm that this `master` branch has the same history (found by using `git log` as the `patchTargetRepositoryBaseBranch`).
+You can verify the branches that exist in the split-target repository by using `git branch --all`.
+
+### Create the repository in github
+
+Create the split-target repository in github using its web interface. Create this repository with the following
+parameters:
+- It does not have a description
+- It is created _without_ README
+- It has a license of _None_
+- It has a .gitignore of _None_
+
+### Add the repository remote corresponding to the github repository
+
+Example:
+```
+git remote add origin git@github.com:<organisation-name>/<repository-name>.git
+```
+
+### Push the split-target branches to github
+
+Example:
+```
+git checkout master
+git push origin HEAD
+git checkout split-target-base-branch
+git push origin HEAD
+```
+
+### Verify that the default branch for your github repository is the `master` branch
+
+Go to the github repository settings to confirm that the default branch is the `master` branch.
+
+### Clone the github repository to verify that it has been created as expected
+
 ## Versioning
 
 This pipeline does not produce any artifacts.
