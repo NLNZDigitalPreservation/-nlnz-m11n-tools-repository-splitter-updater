@@ -157,6 +157,15 @@ Closure<String[]> allPreserveBranchNames = {
     allBranchNames as String[]
 }
 
+Closure<String> extractRepositoryName = { String gitRepositoryUrl ->
+    int lastIndex = gitRepositoryUrl.lastIndexOf('/')
+    if (lastIndex >= 0) {
+        return gitRepositoryUrl.substring(lastIndex + 1)
+    } else {
+        return gitRepositoryUrl
+    }
+}
+
 Closure<RepositoryWorkflow> createRepositoryWorkflow = { boolean allProcessingValues ->
     RepositoryWorkflow repositoryWorkflow = new RepositoryWorkflow()
 
@@ -372,14 +381,15 @@ task cloneSplitTargetRepositories(dependsOn: [ assembleProjectsParameters, clone
             gitCommander.showOutput = (Boolean) project.showCommandOutputValue
             gitCommander.setup()
             filteredProjectNamesList.each { String projectNameKey ->
-                String command = "git clone -b ${allPreserveBranchNames().first()} ${project.splitTargetRepositoryServerUrlBaseName}/${projectNameKey}.git"
+                String command = "git clone -b ${allPreserveBranchNames().first()} ${project.splitTargetRepositoryServerUrlBaseName}${projectNameKey}.git"
                 executeCommand(command, rootFolder)
-                String clonePath = "${rootFolder.absolutePath}${File.separator}${projectNameKey}"
+                String repositoryName = extractRepositoryName("${project.splitTargetRepositoryServerUrlBaseName}${projectNameKey}")
+                String clonePath = "${rootFolder.absolutePath}${File.separator}${repositoryName}"
                 allPreserveBranchNames().each { String branchName ->
                     gitCommander.checkoutBranch(clonePath, branchName, true)
                 }
                 if (project.doCreatePatchTargetRepositoryBranch) {
-                    gitCommander.createBranch(clonePath, project.patchTargetRepositoryBranchName, project.patchTargetRepositoryBaseBranchName)
+                    gitCommander.createBranch(rootFolder.absolutePath, project.patchTargetRepositoryBranchName, project.patchTargetRepositoryBaseBranchName)
                 }
                 if (project.doCloneSplitTargetRepositoriesRemoveRemoteOrigin) {
                     gitCommander.removeRemoteOrigin(clonePath)
